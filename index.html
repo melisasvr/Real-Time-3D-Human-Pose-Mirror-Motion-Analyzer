@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FORM — 3D Pose Mirror</title>
+<!--
+╔═══════════════════════════════════════════════════════════╗
+║  FORM  —  3D Motion Mirror & Posture Analyzer            ║
+║  index.html  ·  works alongside  pose_engine.py          ║
+║                                                          ║
+║  Architecture:                                           ║
+║   • MediaPipe Pose   – landmark detection in browser     ║
+║   • Pyodide          – CPython 3.11 in WebAssembly       ║
+║   • pose_engine.py   – fetched & executed by Pyodide     ║
+║       └─ NumPy angle math + Butterworth filter           ║
+║       └─ SciPy sosfilt per-landmark smoothing            ║
+║       └─ Rule-based posture analyser                     ║
+║       └─ Motion velocity tracker                         ║
+║       └─ Session recorder / replay                       ║
+║   • Three.js         – 3D skeleton renderer              ║
+║                                                          ║
+║  USAGE (same folder as pose_engine.py):                  ║
+║    python -m http.server 8080                            ║
+║    Open http://localhost:8080                            ║
+╚═══════════════════════════════════════════════════════════╝
+-->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;700&family=Barlow+Condensed:wght@300;400;600;800&display=swap');
+
+:root {
+  --bg:      #04080c;
+  --surf:    #080e14;
+  --panel:   #0c1520;
+  --bord:    #162030;
+  --bord2:   #1e3045;
+  --acc:     #00d4ff;
+  --acc2:    #ff6b35;
+  --good:    #39ff8a;
+  --warn:    #ffc233;
+  --bad:     #ff3355;
+  --text:    #c8dde8;
+  --muted:   #2e4a60;
+  --mono:    'IBM Plex Mono', monospace;
+  --cond:    'Barlow Condensed', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 20px;
+  background: var(--surf);
+  border-bottom: 1px solid var(--bord);
+  flex-shrink: 0;
+}
+.logo {
+  font-family: var(--cond); font-size: 22px; font-weight: 800;
+  letter-spacing: 6px; color: var(--acc); text-transform: uppercase;
+}
+.logo-sub { font-size: 8px; letter-spacing: 3px; color: var(--muted); font-family: var(--mono); }
+
+.hdr-chips { display: flex; gap: 10px; align-items: center; }
+.chip {
+  display: flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 2px;
+  border: 1px solid var(--bord2); background: var(--panel);
+  font-size: 9px; letter-spacing: 2px; color: var(--muted);
+  text-transform: uppercase; transition: all .3s;
+}
+.chip .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.chip.ok   { border-color: var(--good); color: var(--good); }
+.chip.warn { border-color: var(--warn); color: var(--warn); }
+.chip.bad  { border-color: var(--bad);  color: var(--bad);
+             animation: blink 1s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+.main { display: flex; flex: 1; overflow: hidden; }
+
+.left {
+  width: 300px; flex-shrink: 0;
+  background: var(--surf); border-right: 1px solid var(--bord);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.col-hdr {
+  font-size: 8px; letter-spacing: 3px; text-transform: uppercase;
+  color: var(--muted); padding: 6px 12px;
+  border-bottom: 1px solid var(--bord);
+  display: flex; justify-content: space-between;
+}
+
+.cam-box {
+  position: relative; width: 100%;
+  aspect-ratio: 4/3; background: #000; flex-shrink: 0; overflow: hidden;
+}
+#webcam {
+  width: 100%; height: 100%; object-fit: cover;
+  transform: scaleX(-1); display: block;
+}
+#cv2d {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  transform: scaleX(-1);
+}
+.cam-hud-tl {
+  position: absolute; top: 7px; left: 7px;
+  font-size: 9px; color: var(--acc); background: rgba(0,0,0,.65);
+  padding: 2px 7px; border-radius: 2px;
+}
+.cam-hud-tr {
+  position: absolute; top: 7px; right: 7px;
+  font-size: 9px; color: var(--good); background: rgba(0,0,0,.65);
+  padding: 2px 7px; border-radius: 2px;
+}
+
+.score-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 14px; border-bottom: 1px solid var(--bord); flex-shrink: 0;
+}
+.ring-box { position: relative; width: 64px; height: 64px; flex-shrink: 0; }
+.ring-num {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  font-family: var(--cond); font-size: 24px; font-weight: 800; line-height: 1;
+}
+.ring-num small { font-family: var(--mono); font-size: 8px; color: var(--muted); font-weight: 400; }
+.score-meta { flex: 1; }
+.score-lbl { font-family: var(--cond); font-size: 16px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; }
+.score-desc { font-size: 9px; color: var(--muted); letter-spacing: 1px; margin-top: 2px; }
+
+.fb-list {
+  flex: 1; overflow-y: auto; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.fb {
+  border-radius: 2px; padding: 8px 10px;
+  border: 1px solid var(--bord); background: var(--panel); font-size: 10px;
+  transition: border-color .3s, background .3s;
+}
+.fb.good { border-color: rgba(57,255,138,.25); background: rgba(57,255,138,.04); }
+.fb.warn { border-color: rgba(255,194,51,.25);  background: rgba(255,194,51,.04); }
+.fb.bad  { border-color: rgba(255,51,85,.25);   background: rgba(255,51,85,.04); }
+.fb-t { font-size: 8px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 3px; }
+.fb.good .fb-t { color: var(--good); }
+.fb.warn .fb-t { color: var(--warn); }
+.fb.bad  .fb-t { color: var(--bad); }
+.fb-b { color: var(--text); line-height: 1.5; }
+
+.centre {
+  flex: 1; position: relative; background: var(--bg);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+#cv3d { flex: 1; width: 100%; display: block; }
+
+.scene-tl {
+  position: absolute; top: 12px; left: 14px;
+  font-size: 8px; letter-spacing: 2px; color: var(--muted);
+  line-height: 2; pointer-events: none; text-transform: uppercase;
+}
+.scene-tr {
+  position: absolute; top: 12px; right: 14px;
+  font-size: 8px; letter-spacing: 1px; color: var(--muted);
+  text-align: right; line-height: 2; pointer-events: none;
+}
+
+.motion-row {
+  position: absolute; bottom: 54px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px;
+  font-size: 8px; letter-spacing: 2px; color: var(--muted); text-transform: uppercase;
+}
+.m-track { width: 120px; height: 2px; background: var(--bord); border-radius: 1px; }
+.m-fill  { height: 100%; border-radius: 1px; background: var(--acc); transition: width .1s, background .3s; }
+
+.ctrl {
+  position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 6px;
+}
+.cb {
+  font-family: var(--mono); font-size: 8px; letter-spacing: 2px;
+  padding: 5px 11px; background: rgba(8,14,20,.9);
+  border: 1px solid var(--bord); color: var(--muted);
+  cursor: pointer; border-radius: 2px; text-transform: uppercase;
+  transition: all .2s;
+}
+.cb:hover    { border-color: var(--acc); color: var(--acc); }
+.cb.on       { border-color: var(--acc); color: var(--acc); background: rgba(0,212,255,.07); }
+.cb.rec-btn  { border-color: var(--bad); color: var(--bad); }
+.cb.rec-btn.on { background: rgba(255,51,85,.08); animation: blink 1s infinite; }
+.cb:disabled { opacity: .28; cursor: not-allowed; }
+
+.right {
+  width: 200px; flex-shrink: 0;
+  background: var(--surf); border-left: 1px solid var(--bord);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.tabs { display: flex; border-bottom: 1px solid var(--bord); }
+.tab {
+  flex: 1; font-family: var(--mono); font-size: 8px;
+  letter-spacing: 2px; text-transform: uppercase;
+  padding: 7px; text-align: center; cursor: pointer;
+  color: var(--muted); border: none; background: none;
+  border-right: 1px solid var(--bord); transition: all .2s;
+}
+.tab:last-child { border-right: none; }
+.tab.on { color: var(--acc); border-bottom: 2px solid var(--acc); }
+
+.angles { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 5px; }
+.ai {
+  border: 1px solid var(--bord); border-radius: 2px;
+  padding: 6px 8px; background: var(--panel);
+}
+.ai-name { font-size: 7px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+.ai-row  { display: flex; justify-content: space-between; align-items: flex-end; }
+.ai-val  { font-family: var(--cond); font-size: 20px; font-weight: 600; line-height: 1; }
+.ai-unit { font-size: 8px; color: var(--muted); }
+.ai-ok   { font-size: 9px; }
+.ai-bar  { height: 2px; background: var(--bord); border-radius: 1px; margin-top: 4px; overflow: hidden; }
+.ai-fill { height: 100%; border-radius: 1px; transition: width .12s, background .3s; }
+
+.xyz { flex: 1; overflow-y: auto; padding: 9px; font-size: 8px; line-height: 2; display: none; }
+
+.rep {
+  border-top: 1px solid var(--bord); padding: 9px; flex-shrink: 0;
+}
+.rep-lbl { font-size: 7px; letter-spacing: 3px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.rep-btns { display: flex; gap: 5px; }
+.rb {
+  flex: 1; font-family: var(--mono); font-size: 7px;
+  padding: 5px 0; background: var(--panel);
+  border: 1px solid var(--bord); color: var(--muted);
+  cursor: pointer; border-radius: 2px; text-align: center;
+  text-transform: uppercase; transition: all .2s; letter-spacing: 1px;
+}
+.rb:hover { border-color: var(--acc); color: var(--acc); }
+.rb:disabled { opacity: .28; cursor: not-allowed; }
+.rep-info { font-size: 8px; color: var(--muted); margin-top: 6px; text-align: center; }
+
+.py-info {
+  border-top: 1px solid var(--bord); padding: 7px 9px;
+  font-size: 8px; color: var(--muted); line-height: 1.9;
+}
+
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: var(--surf); }
+::-webkit-scrollbar-thumb { background: var(--bord2); border-radius: 2px; }
+
+#overlay {
+  position: fixed; inset: 0; background: var(--bg);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  z-index: 200; gap: 18px; text-align: center;
+}
+.ol-logo {
+  font-family: var(--cond); font-size: 72px; font-weight: 800;
+  letter-spacing: 16px; color: var(--acc); text-transform: uppercase;
+  text-shadow: 0 0 60px rgba(0,212,255,.3);
+}
+.ol-sub {
+  font-size: 9px; letter-spacing: 4px; color: var(--muted);
+  text-transform: uppercase; line-height: 2.5; max-width: 460px;
+}
+.ol-tags { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+.ol-tag {
+  font-size: 7px; letter-spacing: 2px; text-transform: uppercase;
+  color: var(--muted); border: 1px solid var(--bord2);
+  padding: 3px 10px; border-radius: 20px;
+}
+.ol-bar  { width: 240px; height: 2px; background: var(--bord); border-radius: 1px; overflow: hidden; }
+.ol-fill { height: 100%; background: var(--acc); border-radius: 1px; transition: width .4s; }
+.ol-msg  { font-size: 9px; letter-spacing: 2px; color: var(--muted); }
+.ol-step {
+  font-size: 8px; color: var(--muted); letter-spacing: 1px;
+  border: 1px solid var(--bord); padding: 5px 16px; border-radius: 2px;
+}
+.ol-step span { color: var(--good); }
+.ol-btn {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 4px;
+  padding: 12px 36px; background: transparent;
+  border: 1px solid var(--acc); color: var(--acc);
+  cursor: pointer; text-transform: uppercase; border-radius: 2px;
+  transition: all .2s; display: none;
+}
+.ol-btn:hover { background: rgba(0,212,255,.1); box-shadow: 0 0 30px rgba(0,212,255,.2); }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <div class="ol-logo">FORM</div>
+  <div class="ol-sub">
+    3D Pose Mirror · Real-time Posture Analysis<br>
+    Python (Pyodide) + NumPy + SciPy · MediaPipe · Three.js
+  </div>
+  <div class="ol-tags">
+    <span class="ol-tag">Butterworth Filter</span>
+    <span class="ol-tag">NumPy Angles</span>
+    <span class="ol-tag">3D Skeleton</span>
+    <span class="ol-tag">Motion Replay</span>
+    <span class="ol-tag">Posture Score</span>
+    <span class="ol-tag">In-Browser Python</span>
+  </div>
+  <div class="ol-bar"><div class="ol-fill" id="ol-fill" style="width:0%"></div></div>
+  <div class="ol-msg" id="ol-msg">Initialising…</div>
+  <div class="ol-step" id="ol-step">
+    Pyodide: <span id="py-st">loading…</span> &nbsp;|&nbsp;
+    MediaPipe: <span id="mp-st">waiting…</span>
+  </div>
+  <button class="ol-btn" id="ol-btn" onclick="startApp()">Enable Camera &amp; Start</button>
+</div>
+
+<header>
+  <div>
+    <div class="logo">FORM</div>
+    <div class="logo-sub">3D Pose Mirror · Python in Browser via Pyodide</div>
+  </div>
+  <div class="hdr-chips">
+    <div class="chip" id="ch-py">  <div class="dot"></div>PYTHON</div>
+    <div class="chip" id="ch-cam"> <div class="dot"></div>CAMERA</div>
+    <div class="chip" id="ch-pose"><div class="dot"></div>POSE</div>
+    <div class="chip" id="ch-rec"> <div class="dot"></div>REC</div>
+    <div class="chip ok"><div class="dot"></div><span id="fps-hdr">0 FPS</span></div>
+  </div>
+  <div style="font-size:8px;letter-spacing:2px;color:var(--muted)">DRAG · SCROLL · RIGHT-DRAG</div>
+</header>
+
+<div class="main">
+  <div class="left">
+    <div class="col-hdr">LIVE FEED <span>2D OVERLAY</span></div>
+    <div class="cam-box">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="cv2d"></canvas>
+      <div class="cam-hud-tl" id="hud-fps">-- FPS</div>
+      <div class="cam-hud-tr" id="hud-vis">-- %</div>
+    </div>
+    <div class="score-row">
+      <div class="ring-box">
+        <svg width="64" height="64" viewBox="0 0 64 64">
+          <circle cx="32" cy="32" r="27" fill="none" stroke="var(--bord2)" stroke-width="4"/>
+          <circle id="ring" cx="32" cy="32" r="27" fill="none"
+            stroke="var(--good)" stroke-width="4"
+            stroke-dasharray="169.6" stroke-dashoffset="169.6"
+            stroke-linecap="round" transform="rotate(-90 32 32)"
+            style="transition:stroke-dashoffset .5s,stroke .5s"/>
+        </svg>
+        <div class="ring-num"><span id="ring-n">--</span><small>/100</small></div>
+      </div>
+      <div class="score-meta">
+        <div class="score-lbl" id="score-lbl" style="color:var(--muted)">POSTURE</div>
+        <div class="score-desc" id="score-desc">Step into frame…</div>
+      </div>
+    </div>
+    <div class="fb-list" id="fb-list">
+      <div class="fb">
+        <div class="fb-t">SYSTEM</div>
+        <div class="fb-b">Loading Pyodide + NumPy + SciPy. Please wait (~15s first load).</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="centre">
+    <div class="scene-tl">ORBIT — DRAG<br>ZOOM — SCROLL<br>PAN — RIGHT-DRAG</div>
+    <div class="scene-tr" id="scene-tr">LANDMARKS: 0/33<br>PYTHON: --</div>
+    <canvas id="cv3d"></canvas>
+    <div class="motion-row">
+      MOTION
+      <div class="m-track"><div class="m-fill" id="m-fill" style="width:0%"></div></div>
+      <span id="m-val">0.0</span>
+    </div>
+    <div class="ctrl">
+      <button class="cb on"      id="cb-sk" onclick="tog('sk')">SKELETON</button>
+      <button class="cb"         id="cb-jt" onclick="tog('jt')">JOINTS</button>
+      <button class="cb on"      id="cb-gr" onclick="tog('gr')">GRID</button>
+      <button class="cb on"      id="cb-sm" onclick="tog('sm')">SMOOTH</button>
+      <button class="cb rec-btn" id="cb-rc" onclick="toggleRec()">● REC</button>
+      <button class="cb"         id="cb-rp" onclick="startReplay()" disabled>▶ REPLAY</button>
+      <button class="cb"                    onclick="orbit.reset()">RESET</button>
+    </div>
+  </div>
+
+  <div class="right">
+    <div class="tabs">
+      <button class="tab on" onclick="switchTab('a')">ANGLES</button>
+      <button class="tab"    onclick="switchTab('x')">XYZ</button>
+    </div>
+    <div class="angles" id="tab-a"></div>
+    <div class="xyz"    id="tab-x"></div>
+    <div class="rep">
+      <div class="rep-lbl">MOTION REPLAY</div>
+      <div class="rep-btns">
+        <button class="rb" id="rb-pl" onclick="startReplay()" disabled>PLAY</button>
+        <button class="rb" id="rb-st" onclick="stopReplay()"  disabled>STOP</button>
+        <button class="rb" id="rb-cl" onclick="clearRec()"   disabled>CLEAR</button>
+      </div>
+      <div class="rep-info" id="rep-info">NO RECORDING</div>
+    </div>
+    <div class="py-info" id="py-info">
+      PYTHON: loading…<br>ENGINE: pose_engine.py<br>FILTER: Butterworth 2nd-order
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── Three.js ──────────────────────────────────────────────────────────────
+const cv3d = document.getElementById('cv3d');
+const renderer = new THREE.WebGLRenderer({ canvas:cv3d, antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setClearColor(0x04080c);
+const scene = new THREE.Scene();
+const cam3  = new THREE.PerspectiveCamera(48,1,.01,100);
+
+class Orbit {
+  constructor(c,el){ this.c=c;this.el=el;this.th=0;this.ph=Math.PI/2.2;this.r=3.2;this.tgt=new THREE.Vector3(0,0.5,0);this.drag=false;this.right=false;this.lx=0;this.ly=0;el.addEventListener('mousedown',e=>{this.drag=true;this.lx=e.clientX;this.ly=e.clientY;this.right=e.button===2;});el.addEventListener('contextmenu',e=>e.preventDefault());window.addEventListener('mouseup',()=>{this.drag=false;});window.addEventListener('mousemove',e=>{if(!this.drag)return;const dx=e.clientX-this.lx,dy=e.clientY-this.ly;this.lx=e.clientX;this.ly=e.clientY;if(this.right){this.tgt.x-=dx*.003;this.tgt.y+=dy*.003;}else{this.th-=dx*.005;this.ph=Math.max(.08,Math.min(Math.PI-.08,this.ph-dy*.005));}this._u();});el.addEventListener('wheel',e=>{this.r=Math.max(1.2,Math.min(9,this.r+e.deltaY*.005));this._u();});this._u();}
+  _u(){this.c.position.set(this.tgt.x+this.r*Math.sin(this.ph)*Math.sin(this.th),this.tgt.y+this.r*Math.cos(this.ph),this.tgt.z+this.r*Math.sin(this.ph)*Math.cos(this.th));this.c.lookAt(this.tgt);}
+  reset(){this.th=0;this.ph=Math.PI/2.2;this.r=3.2;this.tgt.set(0,0.5,0);this._u();}
+}
+const orbit=new Orbit(cam3,cv3d);
+
+scene.add(new THREE.AmbientLight(0xffffff,.22));
+const dl=new THREE.DirectionalLight(0x00d4ff,1.4);dl.position.set(2,5,3);scene.add(dl);
+const fl=new THREE.DirectionalLight(0xff6b35,.5);fl.position.set(-3,-2,-3);scene.add(fl);
+const rl=new THREE.PointLight(0x00d4ff,.6,10);rl.position.set(0,3,-2);scene.add(rl);
+
+const grid=new THREE.GridHelper(6,28,0x162030,0x0c1520);grid.position.y=-1.8;scene.add(grid);
+
+const CONNS=[[11,12],[11,23],[12,24],[23,24],[11,13],[13,15],[15,17],[15,19],[17,19],[12,14],[14,16],[16,18],[16,20],[18,20],[23,25],[25,27],[27,29],[27,31],[29,31],[24,26],[26,28],[28,30],[28,32],[30,32],[0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[11,9],[12,10]];
+const skelGrp=new THREE.Group();scene.add(skelGrp);
+const jointGrp=new THREE.Group();scene.add(jointGrp);
+const bones=CONNS.map(()=>{const m=new THREE.Mesh(new THREE.CylinderGeometry(.013,.013,1,6),new THREE.MeshPhongMaterial({color:0x00d4ff,emissive:0x001a22,shininess:80}));m.visible=false;skelGrp.add(m);return m;});
+const joints=Array.from({length:33},()=>{const m=new THREE.Mesh(new THREE.SphereGeometry(.026,8,8),new THREE.MeshPhongMaterial({color:0x39ff8a,emissive:0x002d12,shininess:100}));m.visible=false;jointGrp.add(m);return m;});
+
+// ── State ──────────────────────────────────────────────────────────────────
+let showSk=true,showJt=false,showGr=true,smoothOn=true;
+let pyodide=null,pyReady=false;
+let processFrame=null,resetSmoother=null,recordControl=null,getReplayFrame=null;
+let isRec=false,isReplay=false;
+let replayTotal=0,replayIdx=0,replayTimer=null;
+let lastSmoothed=null,motionV=0;
+let fpsCount=0,lastFpsT=performance.now(),fps=0;
+let pyCallMs=0;
+
+// ── Pyodide bootstrap ──────────────────────────────────────────────────────
+function setOL(msg,pct){document.getElementById('ol-msg').textContent=msg;document.getElementById('ol-fill').style.width=pct+'%';}
+
+async function bootPyodide(){
+  const s=document.createElement('script');
+  s.src='https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js';
+  document.head.appendChild(s);
+  await new Promise(r=>s.onload=r);
+  setOL('Starting Pyodide (CPython 3.11 in WASM)…',15);
+  document.getElementById('py-st').textContent='loading runtime…';
+  pyodide=await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/'});
+  setOL('Installing NumPy + SciPy (~15s first load)…',35);
+  document.getElementById('py-st').textContent='installing packages…';
+  await pyodide.loadPackage(['numpy','scipy']);
+  setOL('Fetching pose_engine.py…',62);
+  document.getElementById('py-st').textContent='loading engine…';
+  let code;
+  try {
+    const r=await fetch('./pose_engine.py');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    code=await r.text();
+  } catch(e) {
+    throw new Error('Cannot load pose_engine.py — serve with: python -m http.server 8080\n'+e.message);
+  }
+  await pyodide.runPythonAsync(code);
+  processFrame   = pyodide.globals.get('process_frame');
+  resetSmoother  = pyodide.globals.get('reset_smoother');
+  recordControl  = pyodide.globals.get('record_control');
+  getReplayFrame = pyodide.globals.get('get_replay_frame');
+  pyReady=true;
+  document.getElementById('py-st').textContent='✓ ready';
+  setChip('ch-py','ok','PYTHON');
+  document.getElementById('py-info').innerHTML='PYTHON: Pyodide 0.26.2<br>NUMPY + SCIPY: loaded<br>FILTER: Butterworth 2nd-ord';
+}
+
+function loadScript(src){return new Promise((ok,err)=>{const s=document.createElement('script');s.src=src;s.onload=ok;s.onerror=err;document.head.appendChild(s);});}
+async function bootMP(){
+  setOL('Loading MediaPipe Pose…',72);
+  document.getElementById('mp-st').textContent='loading…';
+  const BASE='https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/';
+  await loadScript(BASE+'pose.js');
+  setOL('Loading Camera Utils…',86);
+  await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js');
+  document.getElementById('mp-st').textContent='✓ ready';
+  window._MP_BASE=BASE;
+}
+
+async function boot(){
+  try {
+    await Promise.all([bootPyodide(),bootMP()]);
+    setOL('All systems ready!',100);
+    document.getElementById('ol-msg').style.color='var(--good)';
+    document.getElementById('ol-btn').style.display='block';
+  } catch(e) {
+    document.getElementById('ol-msg').textContent='Error: '+e.message;
+    document.getElementById('ol-msg').style.color='var(--bad)';
+    console.error(e);
+  }
+}
+boot();
+
+// ── Start ──────────────────────────────────────────────────────────────────
+async function startApp(){
+  document.getElementById('overlay').style.display='none';
+  resize();
+  const video=document.getElementById('webcam');
+  try {
+    video.srcObject=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+    await new Promise(r=>video.onloadedmetadata=r);
+    setChip('ch-cam','ok','CAMERA');
+  } catch(e){alert('Camera error: '+e.message);return;}
+  const pose=new Pose({locateFile:f=>window._MP_BASE+f});
+  pose.setOptions({modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,minDetectionConfidence:.5,minTrackingConfidence:.5});
+  pose.onResults(onPoseResults);
+  const camera=new Camera(video,{onFrame:async()=>{await pose.send({image:video});},width:640,height:480});
+  camera.start();
+}
+
+// ── Pose results ──────────────────────────────────────────────────────────
+const cv2d=document.getElementById('cv2d');
+const ctx2d=cv2d.getContext('2d');
+const NAMES=['NOSE','','','','','','','','','','','L.SHO','R.SHO','L.ELB','R.ELB','L.WRI','R.WRI','','','','','','','L.HIP','R.HIP','L.KNE','R.KNE','L.ANK','R.ANK','','','',''];
+
+function onPoseResults(results){
+  const lm=results.poseLandmarks, wlm=results.poseWorldLandmarks;
+  draw2D(lm);
+  if(!lm||!wlm){
+    setChip('ch-pose','','POSE');lastSmoothed=null;
+    bones.forEach(b=>b.visible=false);joints.forEach(j=>j.visible=false);
+    renderFeedback([],null);return;
+  }
+  setChip('ch-pose','ok','POSE');
+  const avgVis=lm.reduce((s,l)=>s+(l.visibility||0),0)/lm.length;
+  document.getElementById('hud-vis').textContent=(avgVis*100).toFixed(0)+'%';
+  document.getElementById('tab-x').innerHTML=[0,11,12,13,14,15,16,23,24,25,26,27,28].map(i=>{const p=wlm[i];if(!p)return '';return `<span style="color:var(--acc)">${(NAMES[i]||'PT'+i).padEnd(5)}</span> x:<span style="color:var(--text)">${p.x.toFixed(3)}</span> y:<span style="color:var(--text)">${p.y.toFixed(3)}</span> z:<span style="color:var(--text)">${(p.z||0).toFixed(3)}</span><br>`;}).join('');
+
+  if(!pyReady){lastSmoothed=wlm.map(l=>({x:l.x,y:l.y,z:l.z||0,visibility:l.visibility||0}));return;}
+
+  const lmArr=wlm.map(l=>({x:l.x,y:l.y,z:l.z||0,visibility:l.visibility||0}));
+  const t0=performance.now();
+  let result;
+  try{result=JSON.parse(processFrame(JSON.stringify(lmArr)));}
+  catch(e){console.warn('Python err:',e);return;}
+  pyCallMs=Math.round(performance.now()-t0);
+
+  lastSmoothed=result.smoothed;
+  motionV=Math.min(100,result.motion.velocity*4);
+  document.getElementById('m-fill').style.width=motionV+'%';
+  document.getElementById('m-fill').style.background=motionV>65?'var(--warn)':'var(--acc)';
+  document.getElementById('m-val').textContent=result.motion.velocity.toFixed(1);
+  renderAngles(result.angles);
+  renderFeedback(result.feedback,result.score);
+  const vis=result.smoothed.filter(l=>l.visibility>.5).length;
+  document.getElementById('scene-tr').innerHTML=`LANDMARKS: ${vis}/33<br>PYTHON: ${pyCallMs}ms`;
+}
+
+// ── 3D skeleton ──────────────────────────────────────────────────────────
+function updateSkel(lm){
+  if(!lm||lm.length<33)return;
+  // World landmarks are already centred ~0; find hip midpoint to anchor skeleton
+  const lh=lm[23], rh=lm[24];
+  const cx=(lh&&rh)?(lh.x+rh.x)*0.5:0;
+  const cy=(lh&&rh)?(lh.y+rh.y)*0.5:0;
+  const cz=(lh&&rh)?((lh.z||0)+(rh.z||0))*0.5:0;
+  // Scale: world coords are in metres (~0.5m torso height → map to ~2 units)
+  const S=4.0;
+  const pts=lm.map(l=>new THREE.Vector3(
+    -(l.x - cx)*S,
+    -(l.y - cy)*S + 0.5,
+    -(( l.z||0) - cz)*S
+  ));
+  joints.forEach((m,i)=>{m.position.copy(pts[i]);m.visible=showJt&&(lm[i].visibility>.3);});
+  const up=new THREE.Vector3(0,1,0);
+  CONNS.forEach(([a,b],i)=>{
+    const va=lm[a]?.visibility||0,vb=lm[b]?.visibility||0;
+    bones[i].visible=showSk&&va>.3&&vb>.3;
+    if(!bones[i].visible)return;
+    const pA=pts[a],pB=pts[b];
+    const mid=new THREE.Vector3().addVectors(pA,pB).multiplyScalar(.5);
+    bones[i].position.copy(mid);
+    const dir=new THREE.Vector3().subVectors(pB,pA).normalize();
+    bones[i].quaternion.setFromUnitVectors(up,dir);
+    bones[i].scale.y=pA.distanceTo(pB);
+    const t=Math.min(1,motionV/100);
+    bones[i].material.color.lerpColors(new THREE.Color(0x00d4ff),new THREE.Color(0xff6b35),t);
+  });
+}
+
+function draw2D(lm){
+  const w=cv2d.width,h=cv2d.height;ctx2d.clearRect(0,0,w,h);if(!lm)return;
+  ctx2d.lineWidth=2;
+  CONNS.forEach(([a,b])=>{
+    const A=lm[a],B=lm[b];if(!A||!B||(A.visibility||0)<.3||(B.visibility||0)<.3)return;
+    const g=ctx2d.createLinearGradient(A.x*w,A.y*h,B.x*w,B.y*h);
+    g.addColorStop(0,'rgba(0,212,255,.85)');g.addColorStop(1,'rgba(255,107,53,.85)');
+    ctx2d.strokeStyle=g;ctx2d.beginPath();ctx2d.moveTo(A.x*w,A.y*h);ctx2d.lineTo(B.x*w,B.y*h);ctx2d.stroke();
+  });
+  lm.forEach(l=>{if((l.visibility||0)<.3)return;ctx2d.beginPath();ctx2d.arc(l.x*w,l.y*h,4,0,Math.PI*2);ctx2d.fillStyle='#39ff8a';ctx2d.fill();ctx2d.strokeStyle='#04080c';ctx2d.lineWidth=1;ctx2d.stroke();});
+}
+
+function renderAngles(angles){
+  const el=document.getElementById('tab-a');el.innerHTML='';
+  angles.forEach(a=>{
+    const val=a.angle!=null?a.angle:'--';
+    const pct=a.angle!=null?(a.angle/180*100).toFixed(0):0;
+    const clr=a.angle==null?'var(--muted)':a.in_ideal?'var(--good)':'var(--warn)';
+    const d=document.createElement('div');d.className='ai';
+    d.innerHTML=`<div class="ai-name">${a.name.replace(/_/g,' ')}</div><div class="ai-row"><div class="ai-val" style="color:${a.angle==null?'var(--muted)':'var(--text)'}">${val}<span class="ai-unit">°</span></div><span class="ai-ok" style="color:${clr}">${a.angle!=null?(a.in_ideal?'✓':'!'):''}${a.ideal&&a.angle!=null?`<span style="color:var(--muted);font-size:7px">${a.ideal[0]}–${a.ideal[1]}</span>`:''}</span></div><div class="ai-bar"><div class="ai-fill" style="width:${pct}%;background:${clr}"></div></div>`;
+    el.appendChild(d);
+  });
+}
+
+function renderFeedback(items,score){
+  document.getElementById('fb-list').innerHTML=items.length?items.map(f=>`<div class="fb ${f.type}"><div class="fb-t">${f.title}</div><div class="fb-b">${f.body}</div></div>`).join(''):'<div class="fb"><div class="fb-t">SYSTEM</div><div class="fb-b">No pose detected.</div></div>';
+  if(score!=null){
+    const arc=169.6;
+    document.getElementById('ring').style.strokeDashoffset=arc-(score/100)*arc;
+    document.getElementById('ring').style.stroke=score>=80?'var(--good)':score>=55?'var(--warn)':'var(--bad)';
+    document.getElementById('ring-n').textContent=score;
+    const lbl=score>=80?'GREAT FORM':score>=55?'NEEDS WORK':'POOR POSTURE';
+    document.getElementById('score-lbl').textContent=lbl;
+    document.getElementById('score-lbl').style.color=score>=80?'var(--good)':score>=55?'var(--warn)':'var(--bad)';
+    document.getElementById('score-desc').textContent='Score: '+score+'/100';
+  } else {
+    document.getElementById('ring').style.strokeDashoffset=169.6;
+    document.getElementById('ring-n').textContent='--';
+    document.getElementById('score-lbl').textContent='POSTURE';
+    document.getElementById('score-lbl').style.color='var(--muted)';
+    document.getElementById('score-desc').textContent='Step into frame…';
+  }
+}
+
+// ── Recording & Replay ─────────────────────────────────────────────────────
+function toggleRec(){
+  if(!pyReady||isReplay)return;
+  isRec=!isRec;
+  const res=JSON.parse(recordControl(isRec?'start':'stop'));
+  document.getElementById('cb-rc').classList.toggle('on',isRec);
+  setChip('ch-rec',isRec?'bad':'','REC');
+  if(!isRec&&res.frame_count>0){
+    replayTotal=res.frame_count;
+    document.getElementById('rep-info').textContent=`${res.frame_count} frames · ${res.fps_avg} fps · ${res.duration_s}s`;
+    ['rb-pl','rb-cl','cb-rp'].forEach(id=>document.getElementById(id).disabled=false);
+  }
+}
+function startReplay(){
+  if(!pyReady||isReplay||replayTotal===0)return;
+  isReplay=true;replayIdx=0;
+  document.getElementById('rb-st').disabled=false;
+  document.getElementById('cb-rp').classList.add('on');
+  replayStep();
+}
+function replayStep(){
+  if(!isReplay)return;
+  const f=JSON.parse(getReplayFrame(replayIdx++));
+  if(f.end){stopReplay();return;}
+  if(f.smoothed)updateSkel(f.smoothed);
+  document.getElementById('rep-info').textContent=`FRAME ${replayIdx}/${replayTotal}`;
+  replayTimer=setTimeout(replayStep,1000/30);
+}
+function stopReplay(){
+  isReplay=false;clearTimeout(replayTimer);
+  document.getElementById('rb-st').disabled=true;
+  document.getElementById('cb-rp').classList.remove('on');
+  document.getElementById('rep-info').textContent=`${replayTotal} frames recorded`;
+}
+function clearRec(){
+  stopReplay();if(pyReady)recordControl('clear');
+  replayTotal=0;
+  ['rb-pl','rb-cl','cb-rp'].forEach(id=>document.getElementById(id).disabled=true);
+  document.getElementById('rep-info').textContent='CLEARED';
+}
+
+function setChip(id,cls,text){const el=document.getElementById(id);el.className='chip'+(cls?' '+cls:'');el.innerHTML=`<div class="dot"></div>${text}`;}
+function tog(w){if(w==='sk'){showSk=!showSk;document.getElementById('cb-sk').classList.toggle('on',showSk);if(!showSk)bones.forEach(b=>b.visible=false);}if(w==='jt'){showJt=!showJt;document.getElementById('cb-jt').classList.toggle('on',showJt);if(!showJt)joints.forEach(j=>j.visible=false);}if(w==='gr'){showGr=!showGr;grid.visible=showGr;document.getElementById('cb-gr').classList.toggle('on',showGr);}if(w==='sm'){smoothOn=!smoothOn;document.getElementById('cb-sm').classList.toggle('on',smoothOn);if(pyReady)resetSmoother();}}
+function switchTab(t){document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('on',['a','x'][i]===t));document.getElementById('tab-a').style.display=t==='a'?'flex':'none';document.getElementById('tab-x').style.display=t==='x'?'block':'none';}
+
+function resize(){const cp=document.querySelector('.centre');const w=cp.clientWidth,h=cp.clientHeight;renderer.setSize(w,h);cam3.aspect=w/h;cam3.updateProjectionMatrix();const cw=document.querySelector('.cam-box');cv2d.width=cw.clientWidth;cv2d.height=cw.clientHeight;}
+window.addEventListener('resize',resize);
+function animate(){requestAnimationFrame(animate);if(!isReplay&&lastSmoothed)updateSkel(lastSmoothed);renderer.render(scene,cam3);fpsCount++;const now=performance.now();if(now-lastFpsT>=1000){fps=fpsCount;fpsCount=0;lastFpsT=now;document.getElementById('fps-hdr').textContent=fps+' FPS';document.getElementById('hud-fps').textContent=fps+' FPS';}}
+animate();
+</script>
+</body>
+</html>
